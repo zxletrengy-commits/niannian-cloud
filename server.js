@@ -161,7 +161,7 @@ app.use(cors({
   ],
   exposedHeaders: ['Mcp-Session-Id'],
 }));
-app.options('*', cors());
+// OPTIONS 预检由 cors() 中间件自动处理，无需手动注册
 
 // Auth
 function authGuard(req, res, next) {
