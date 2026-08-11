@@ -41,7 +41,7 @@
    - `SIGNING_SECRET` = `<随机字符串>`
 3. 连接 GitHub，自动部署
 
-## 小手机（Polaris）配置
+## 小手机年年机配置
 
 - MCP 地址：`https://niannian-cloud.zeabur.app/mcp`
 - 认证：Bearer Token 或自定义头 `X-Auth-Token`
