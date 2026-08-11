@@ -4,20 +4,20 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 
 // ── 配置 ──────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || '/data';
 const PUBLIC_URL = (process.env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/+$/, '');
-const AUTH_TOKEN = process.env.AUTH_TOKEN || '';           // 空 = 不校验
+const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 const AUTH_HEADER_NAME = process.env.AUTH_HEADER_NAME || 'X-Auth-Token';
 const SIGNING_SECRET = process.env.SIGNING_SECRET || crypto.randomBytes(32).toString('hex');
 
 const SLOTS = ['manual', 'auto-1', 'auto-2', 'auto-3'];
-const TOKEN_TTL_MS = 10 * 60 * 1000;                      // 签名 URL 10 分钟有效
-const MAX_BODY_BYTES = 512 * 1024 * 1024;                  // 512MB 上限
+const TOKEN_TTL_MS = 10 * 60 * 1000;
+const MAX_BODY_BYTES = 512 * 1024 * 1024;
 
 // ── 数据目录 ──────────────────────────────────────────
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -108,7 +108,7 @@ mcp.tool(
     snapshotId: z.string().optional()
       .describe('快照 ID'),
     metadata: z.any().optional()
-      .describe('存档元数据（含 createdAt/sha256/bytes/summary 等）'),
+      .describe('存档元数据'),
   },
   async (args) => {
     switch (args.action) {
@@ -160,7 +160,6 @@ mcp.tool(
 // ── Express ───────────────────────────────────────────
 const app = express();
 
-// CORS
 app.use(cors({
   origin: true,
   credentials: true,
@@ -178,28 +177,35 @@ app.options('*', cors());
 function authGuard(req, res, next) {
   if (!AUTH_TOKEN) return next();
   if (extractToken(req) !== AUTH_TOKEN) {
-    return res.status(401).json({ error: 'Unauthorized: token 不正确' });
+    return res.status(401).json({
+      jsonrpc: '2.0',
+      id: null,
+      error: { code: -32001, message: 'Unauthorized: token 不正确' },
+    });
   }
   next();
 }
 
-// ── MCP SSE 端点 ──
-let transport;
+// ── MCP Streamable HTTP ──
+const transport = new StreamableHTTPServerTransport();
+await mcp.connect(transport);
 
-app.get('/sse', authGuard, async (req, res) => {
-  transport = new SSEServerTransport('/messages', res);
-  await mcp.connect(transport);
-});
-
-app.post('/messages', authGuard, express.json({ limit: '1mb' }), async (req, res) => {
-  if (transport) {
-    await transport.handlePostMessage(req, res);
-  } else {
-    res.status(400).json({ error: 'No active SSE connection — 请先 GET /sse' });
+app.post('/mcp', authGuard, async (req, res) => {
+  try {
+    await transport.handleRequest(req, res);
+  } catch (err) {
+    console.error('[MCP]', err.message);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: '2.0',
+        id: null,
+        error: { code: -32603, message: 'Internal server error' },
+      });
+    }
   }
 });
 
-// ── 上传端点（签名 URL 认证，不走 MCP token）──
+// ── 上传 / 下载端点 ──
 app.put('/api/upload/:slot', express.raw({ type: '*/*', limit: '512mb' }), (req, res) => {
   const { slot } = req.params;
   if (!SLOTS.includes(slot)) return res.status(400).json({ error: '无效的槽位' });
@@ -224,7 +230,6 @@ app.put('/api/upload/:slot', express.raw({ type: '*/*', limit: '512mb' }), (req,
   res.status(200).json({ ok: true, id: saved.id });
 });
 
-// ── 下载端点（签名 URL 认证）──
 app.get('/api/download/:slot', (req, res) => {
   const { slot } = req.params;
   if (!SLOTS.includes(slot)) return res.status(400).json({ error: '无效的槽位' });
@@ -243,14 +248,13 @@ app.get('/api/download/:slot', (req, res) => {
   res.status(200).send(buf);
 });
 
-// ── 健康检查 ──
 app.get('/', (_req, res) => {
-  res.json({ ok: true, name: 'niannian-cloud' });
+  res.json({ ok: true, name: 'niannian-cloud', mcp: '/mcp' });
 });
 
 // ── 启动 ──
 app.listen(PORT, () => {
-  console.log(`[niannian-cloud] MCP → ${PUBLIC_URL}/sse  +  POST ${PUBLIC_URL}/messages`);
+  console.log(`[niannian-cloud] MCP → ${PUBLIC_URL}/mcp`);
   console.log(`[niannian-cloud] Auth → ${AUTH_TOKEN ? 'Bearer / ' + AUTH_HEADER_NAME : 'OFF'}`);
   console.log(`[niannian-cloud] Data → ${DATA_DIR}`);
   console.log(`[niannian-cloud] Port → ${PORT}`);

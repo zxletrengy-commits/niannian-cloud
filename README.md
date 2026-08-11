@@ -6,8 +6,7 @@
 
 | 路径 | 方法 | 说明 |
 |------|------|------|
-| `/sse` | GET | MCP SSE 连接 |
-| `/messages` | POST | MCP JSON-RPC |
+| `/mcp` | POST | MCP Streamable HTTP |
 | `/api/upload/:slot` | PUT | 加密存档上传（签名 URL） |
 | `/api/download/:slot` | GET | 加密存档下载（签名 URL） |
 | `/` | GET | 健康检查 |
@@ -44,5 +43,5 @@
 
 ## 小手机（Polaris）配置
 
-- MCP 地址：`https://niannian-cloud.zeabur.app/sse`
+- MCP 地址：`https://niannian-cloud.zeabur.app/mcp`
 - 认证：Bearer Token 或自定义头 `X-Auth-Token`
