@@ -192,7 +192,7 @@ await mcp.connect(transport);
 
 app.post('/mcp', authGuard, async (req, res) => {
   try {
-    await transport.handleRequest(req, res);
+    await transport.handleRequest(req, res, req.body);
   } catch (err) {
     console.error('[MCP]', err.message);
     if (!res.headersSent) {
