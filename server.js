@@ -1,10 +1,10 @@
-import express from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { createMcpExpressApp } from '@modelcontextprotocol/sdk/server/express.js';
 import { z } from 'zod';
 
 // ── 配置 ──────────────────────────────────────────────
@@ -103,12 +103,9 @@ mcp.tool(
   {
     action: z.enum(['list', 'prepare_upload', 'prepare_download']).describe('操作类型'),
     protocolVersion: z.literal(1).describe('协议版本，固定为 1'),
-    slot: z.enum(['manual', 'auto-1', 'auto-2', 'auto-3']).optional()
-      .describe('备份槽位'),
-    snapshotId: z.string().optional()
-      .describe('快照 ID'),
-    metadata: z.any().optional()
-      .describe('存档元数据'),
+    slot: z.enum(['manual', 'auto-1', 'auto-2', 'auto-3']).optional().describe('备份槽位'),
+    snapshotId: z.string().optional().describe('快照 ID'),
+    metadata: z.any().optional().describe('存档元数据'),
   },
   async (args) => {
     switch (args.action) {
@@ -120,33 +117,25 @@ mcp.tool(
           isError: false,
         };
       }
-
       case 'prepare_upload': {
         if (!args.slot) throw new Error('slot 为必填项');
         if (!args.metadata) throw new Error('metadata 为必填项');
-
         fs.writeFileSync(pendingFile(args.slot), JSON.stringify(args.metadata), 'utf-8');
-
         const token = signPayload({ slot: args.slot, action: 'upload', exp: Date.now() + TOKEN_TTL_MS });
         const uploadUrl = `${PUBLIC_URL}/api/upload/${args.slot}?token=${encodeURIComponent(token)}`;
-
         return {
           content: [{ type: 'text', text: JSON.stringify({ uploadUrl, method: 'PUT', headers: { 'Content-Type': 'application/octet-stream' } }) }],
           structuredContent: { uploadUrl, method: 'PUT', headers: { 'Content-Type': 'application/octet-stream' } },
           isError: false,
         };
       }
-
       case 'prepare_download': {
         if (!args.slot) throw new Error('slot 为必填项');
         if (!args.snapshotId) throw new Error('snapshotId 为必填项');
-
         const snapshot = getSnapshot(args.slot, args.snapshotId);
         if (!snapshot) throw new Error('快照不存在或不属于当前槽位');
-
         const token = signPayload({ slot: args.slot, action: 'download', exp: Date.now() + TOKEN_TTL_MS });
         const downloadUrl = `${PUBLIC_URL}/api/download/${args.slot}?token=${encodeURIComponent(token)}`;
-
         return {
           content: [{ type: 'text', text: JSON.stringify({ downloadUrl, headers: {} }) }],
           structuredContent: { downloadUrl, headers: {} },
@@ -157,9 +146,10 @@ mcp.tool(
   },
 );
 
-// ── Express ───────────────────────────────────────────
-const app = express();
+// ── Express（SDK 官方工厂）───────────────────────────
+const app = createMcpExpressApp({ host: '0.0.0.0' });
 
+// CORS
 app.use(cors({
   origin: true,
   credentials: true,
@@ -173,13 +163,12 @@ app.use(cors({
 }));
 app.options('*', cors());
 
-// Auth helper
+// Auth
 function authGuard(req, res, next) {
   if (!AUTH_TOKEN) return next();
   if (extractToken(req) !== AUTH_TOKEN) {
     return res.status(401).json({
-      jsonrpc: '2.0',
-      id: null,
+      jsonrpc: '2.0', id: null,
       error: { code: -32001, message: 'Unauthorized: token 不正确' },
     });
   }
@@ -194,54 +183,47 @@ app.post('/mcp', authGuard, async (req, res) => {
   try {
     await transport.handleRequest(req, res, req.body);
   } catch (err) {
-    console.error('[MCP]', err.message);
+    console.error('[MCP]', err.message, err.stack);
     if (!res.headersSent) {
-      res.status(500).json({
-        jsonrpc: '2.0',
-        id: null,
-        error: { code: -32603, message: 'Internal server error' },
-      });
+      res.status(500).json({ jsonrpc: '2.0', id: null, error: { code: -32603, message: 'Internal server error' } });
     }
   }
 });
 
-// ── 上传 / 下载端点 ──
-app.put('/api/upload/:slot', express.raw({ type: '*/*', limit: '512mb' }), (req, res) => {
+// ── 上传 / 下载 ──
+app.put('/api/upload/:slot', ((req, res) => {
   const { slot } = req.params;
   if (!SLOTS.includes(slot)) return res.status(400).json({ error: '无效的槽位' });
-
   const payload = verifyToken(req.query.token || '');
   if (!payload || payload.slot !== slot || payload.action !== 'upload') {
     return res.status(403).json({ error: '签名无效或已过期' });
   }
 
-  const buf = req.body;
-  if (!Buffer.isBuffer(buf)) return res.status(400).json({ error: '请求体必须是原始二进制' });
-  if (buf.length > MAX_BODY_BYTES) return res.status(413).json({ error: '文件超过 512MB 上限' });
-
-  fs.writeFileSync(encFile(slot), buf);
-
-  let metadata = {};
-  try { metadata = JSON.parse(fs.readFileSync(pendingFile(slot), 'utf-8')); } catch {}
-  const saved = saveUpload(slot, metadata);
-  try { fs.unlinkSync(pendingFile(slot)); } catch {}
-
-  console.log(`[upload] slot=${slot} id=${saved.id} bytes=${saved.bytes}`);
-  res.status(200).json({ ok: true, id: saved.id });
-});
+  // 收集 body chunks（这个端点不走 express.json）
+  const chunks = [];
+  req.on('data', (chunk) => chunks.push(chunk));
+  req.on('end', () => {
+    const buf = Buffer.concat(chunks);
+    if (buf.length > MAX_BODY_BYTES) return res.status(413).json({ error: '文件超过 512MB 上限' });
+    fs.writeFileSync(encFile(slot), buf);
+    let metadata = {};
+    try { metadata = JSON.parse(fs.readFileSync(pendingFile(slot), 'utf-8')); } catch {}
+    const saved = saveUpload(slot, metadata);
+    try { fs.unlinkSync(pendingFile(slot)); } catch {}
+    console.log(`[upload] slot=${slot} id=${saved.id} bytes=${saved.bytes}`);
+    res.status(200).json({ ok: true, id: saved.id });
+  });
+}));
 
 app.get('/api/download/:slot', (req, res) => {
   const { slot } = req.params;
   if (!SLOTS.includes(slot)) return res.status(400).json({ error: '无效的槽位' });
-
   const payload = verifyToken(req.query.token || '');
   if (!payload || payload.slot !== slot || payload.action !== 'download') {
     return res.status(403).json({ error: '签名无效或已过期' });
   }
-
   const file = encFile(slot);
   if (!fs.existsSync(file)) return res.status(404).json({ error: '文件不存在' });
-
   const buf = fs.readFileSync(file);
   res.setHeader('Content-Type', 'application/octet-stream');
   res.setHeader('Content-Length', buf.length);
@@ -252,7 +234,6 @@ app.get('/', (_req, res) => {
   res.json({ ok: true, name: 'niannian-cloud', mcp: '/mcp' });
 });
 
-// ── 启动 ──
 app.listen(PORT, () => {
   console.log(`[niannian-cloud] MCP → ${PUBLIC_URL}/mcp`);
   console.log(`[niannian-cloud] Auth → ${AUTH_TOKEN ? 'Bearer / ' + AUTH_HEADER_NAME : 'OFF'}`);
