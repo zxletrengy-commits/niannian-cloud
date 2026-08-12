@@ -1,10 +1,10 @@
+import express from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { createMcpExpressApp } from '@modelcontextprotocol/sdk/server/express.js';
 import { z } from 'zod';
 
 // ── 配置 ──────────────────────────────────────────────
@@ -63,9 +63,7 @@ function extractToken(req) {
 // ── 存储层 ────────────────────────────────────────────
 function listSnapshots() {
   const all = readBackups();
-  return SLOTS
-    .filter(s => all[s])
-    .map(s => all[s])
+  return SLOTS.filter(s => all[s]).map(s => all[s])
     .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
 }
 
@@ -98,58 +96,54 @@ function saveUpload(slot, metadata) {
 // ── MCP Server ────────────────────────────────────────
 const mcp = new McpServer({ name: 'niannian-cloud', version: '1.0.0' });
 
-mcp.tool(
-  'phone_cloud_backup',
-  {
-    action: z.enum(['list', 'prepare_upload', 'prepare_download']).describe('操作类型'),
-    protocolVersion: z.literal(1).describe('协议版本，固定为 1'),
-    slot: z.enum(['manual', 'auto-1', 'auto-2', 'auto-3']).optional().describe('备份槽位'),
-    snapshotId: z.string().optional().describe('快照 ID'),
-    metadata: z.any().optional().describe('存档元数据'),
-  },
-  async (args) => {
-    switch (args.action) {
-      case 'list': {
-        const snapshots = listSnapshots();
-        return {
-          content: [{ type: 'text', text: JSON.stringify({ snapshots }) }],
-          structuredContent: { snapshots },
-          isError: false,
-        };
-      }
-      case 'prepare_upload': {
-        if (!args.slot) throw new Error('slot 为必填项');
-        if (!args.metadata) throw new Error('metadata 为必填项');
-        fs.writeFileSync(pendingFile(args.slot), JSON.stringify(args.metadata), 'utf-8');
-        const token = signPayload({ slot: args.slot, action: 'upload', exp: Date.now() + TOKEN_TTL_MS });
-        const uploadUrl = `${PUBLIC_URL}/api/upload/${args.slot}?token=${encodeURIComponent(token)}`;
-        return {
-          content: [{ type: 'text', text: JSON.stringify({ uploadUrl, method: 'PUT', headers: { 'Content-Type': 'application/octet-stream' } }) }],
-          structuredContent: { uploadUrl, method: 'PUT', headers: { 'Content-Type': 'application/octet-stream' } },
-          isError: false,
-        };
-      }
-      case 'prepare_download': {
-        if (!args.slot) throw new Error('slot 为必填项');
-        if (!args.snapshotId) throw new Error('snapshotId 为必填项');
-        const snapshot = getSnapshot(args.slot, args.snapshotId);
-        if (!snapshot) throw new Error('快照不存在或不属于当前槽位');
-        const token = signPayload({ slot: args.slot, action: 'download', exp: Date.now() + TOKEN_TTL_MS });
-        const downloadUrl = `${PUBLIC_URL}/api/download/${args.slot}?token=${encodeURIComponent(token)}`;
-        return {
-          content: [{ type: 'text', text: JSON.stringify({ downloadUrl, headers: {} }) }],
-          structuredContent: { downloadUrl, headers: {} },
-          isError: false,
-        };
-      }
+mcp.tool('phone_cloud_backup', {
+  action: z.enum(['list', 'prepare_upload', 'prepare_download']).describe('操作类型'),
+  protocolVersion: z.literal(1).describe('协议版本，固定为 1'),
+  slot: z.enum(['manual', 'auto-1', 'auto-2', 'auto-3']).optional().describe('备份槽位'),
+  snapshotId: z.string().optional().describe('快照 ID'),
+  metadata: z.any().optional().describe('存档元数据'),
+}, async (args) => {
+  switch (args.action) {
+    case 'list': {
+      const snapshots = listSnapshots();
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ snapshots }) }],
+        structuredContent: { snapshots },
+        isError: false,
+      };
     }
-  },
-);
+    case 'prepare_upload': {
+      if (!args.slot) throw new Error('slot 为必填项');
+      if (!args.metadata) throw new Error('metadata 为必填项');
+      fs.writeFileSync(pendingFile(args.slot), JSON.stringify(args.metadata), 'utf-8');
+      const token = signPayload({ slot: args.slot, action: 'upload', exp: Date.now() + TOKEN_TTL_MS });
+      const uploadUrl = `${PUBLIC_URL}/api/upload/${args.slot}?token=${encodeURIComponent(token)}`;
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ uploadUrl, method: 'PUT', headers: { 'Content-Type': 'application/octet-stream' } }) }],
+        structuredContent: { uploadUrl, method: 'PUT', headers: { 'Content-Type': 'application/octet-stream' } },
+        isError: false,
+      };
+    }
+    case 'prepare_download': {
+      if (!args.slot) throw new Error('slot 为必填项');
+      if (!args.snapshotId) throw new Error('snapshotId 为必填项');
+      const snapshot = getSnapshot(args.slot, args.snapshotId);
+      if (!snapshot) throw new Error('快照不存在或不属于当前槽位');
+      const token = signPayload({ slot: args.slot, action: 'download', exp: Date.now() + TOKEN_TTL_MS });
+      const downloadUrl = `${PUBLIC_URL}/api/download/${args.slot}?token=${encodeURIComponent(token)}`;
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ downloadUrl, headers: {} }) }],
+        structuredContent: { downloadUrl, headers: {} },
+        isError: false,
+      };
+    }
+  }
+});
 
-// ── Express（SDK 官方工厂）───────────────────────────
-const app = createMcpExpressApp({ host: '0.0.0.0' });
+// ── Express ───────────────────────────────────────────
+const app = express();
 
-// CORS
+// CORS 先注册
 app.use(cors({
   origin: true,
   credentials: true,
@@ -161,7 +155,17 @@ app.use(cors({
   ],
   exposedHeaders: ['Mcp-Session-Id'],
 }));
-// OPTIONS 预检由 cors() 中间件自动处理，无需手动注册
+
+// JSON body parser —— MCP 端点用
+app.use('/mcp', express.json());
+
+// 上传端点 —— 原始二进制
+app.use('/api/upload/:slot', (req, res, next) => {
+  const chunks = [];
+  req.on('data', (chunk) => chunks.push(chunk));
+  req.on('end', () => { req.rawBody = Buffer.concat(chunks); next(); });
+  req.on('error', next);
+});
 
 // Auth
 function authGuard(req, res, next) {
@@ -183,45 +187,41 @@ app.post('/mcp', authGuard, async (req, res) => {
   try {
     await transport.handleRequest(req, res, req.body);
   } catch (err) {
-    console.error('[MCP]', err.message, err.stack);
+    console.error('[MCP]', err);
     if (!res.headersSent) {
       res.status(500).json({ jsonrpc: '2.0', id: null, error: { code: -32603, message: 'Internal server error' } });
     }
   }
 });
 
-// ── 上传 / 下载 ──
-app.put('/api/upload/:slot', ((req, res) => {
+// ── 上传 ──
+app.put('/api/upload/:slot', (req, res) => {
   const { slot } = req.params;
   if (!SLOTS.includes(slot)) return res.status(400).json({ error: '无效的槽位' });
   const payload = verifyToken(req.query.token || '');
-  if (!payload || payload.slot !== slot || payload.action !== 'upload') {
+  if (!payload || payload.slot !== slot || payload.action !== 'upload')
     return res.status(403).json({ error: '签名无效或已过期' });
-  }
 
-  // 收集 body chunks（这个端点不走 express.json）
-  const chunks = [];
-  req.on('data', (chunk) => chunks.push(chunk));
-  req.on('end', () => {
-    const buf = Buffer.concat(chunks);
-    if (buf.length > MAX_BODY_BYTES) return res.status(413).json({ error: '文件超过 512MB 上限' });
-    fs.writeFileSync(encFile(slot), buf);
-    let metadata = {};
-    try { metadata = JSON.parse(fs.readFileSync(pendingFile(slot), 'utf-8')); } catch {}
-    const saved = saveUpload(slot, metadata);
-    try { fs.unlinkSync(pendingFile(slot)); } catch {}
-    console.log(`[upload] slot=${slot} id=${saved.id} bytes=${saved.bytes}`);
-    res.status(200).json({ ok: true, id: saved.id });
-  });
-}));
+  const buf = req.rawBody;
+  if (!buf || buf.length === 0) return res.status(400).json({ error: '请求体为空' });
+  if (buf.length > MAX_BODY_BYTES) return res.status(413).json({ error: '文件超过 512MB 上限' });
 
+  fs.writeFileSync(encFile(slot), buf);
+  let metadata = {};
+  try { metadata = JSON.parse(fs.readFileSync(pendingFile(slot), 'utf-8')); } catch {}
+  const saved = saveUpload(slot, metadata);
+  try { fs.unlinkSync(pendingFile(slot)); } catch {}
+  console.log(`[upload] slot=${slot} id=${saved.id} bytes=${saved.bytes}`);
+  res.status(200).json({ ok: true, id: saved.id });
+});
+
+// ── 下载 ──
 app.get('/api/download/:slot', (req, res) => {
   const { slot } = req.params;
   if (!SLOTS.includes(slot)) return res.status(400).json({ error: '无效的槽位' });
   const payload = verifyToken(req.query.token || '');
-  if (!payload || payload.slot !== slot || payload.action !== 'download') {
+  if (!payload || payload.slot !== slot || payload.action !== 'download')
     return res.status(403).json({ error: '签名无效或已过期' });
-  }
   const file = encFile(slot);
   if (!fs.existsSync(file)) return res.status(404).json({ error: '文件不存在' });
   const buf = fs.readFileSync(file);
@@ -230,9 +230,7 @@ app.get('/api/download/:slot', (req, res) => {
   res.status(200).send(buf);
 });
 
-app.get('/', (_req, res) => {
-  res.json({ ok: true, name: 'niannian-cloud', mcp: '/mcp' });
-});
+app.get('/', (_req, res) => res.json({ ok: true, name: 'niannian-cloud', mcp: '/mcp' }));
 
 app.listen(PORT, () => {
   console.log(`[niannian-cloud] MCP → ${PUBLIC_URL}/mcp`);
