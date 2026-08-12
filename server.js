@@ -3,9 +3,6 @@ import cors from 'cors';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { z } from 'zod';
 
 // ── 配置 ──────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
@@ -33,14 +30,12 @@ function readBackups() {
 function writeBackups(data) {
   fs.writeFileSync(BACKUPS_FILE, JSON.stringify(data, null, 2), 'utf-8');
 }
-
 function signPayload(payload) {
   const json = JSON.stringify(payload);
   const data = Buffer.from(json).toString('base64url');
   const sig = crypto.createHmac('sha256', SIGNING_SECRET).update(data).digest('base64url');
   return `${data}.${sig}`;
 }
-
 function verifyToken(token) {
   try {
     const [data, sig] = token.split('.');
@@ -53,7 +48,6 @@ function verifyToken(token) {
     return payload;
   } catch { return null; }
 }
-
 function extractToken(req) {
   const auth = req.headers.authorization;
   if (auth?.startsWith('Bearer ')) return auth.slice(7);
@@ -66,7 +60,6 @@ function listSnapshots() {
   return SLOTS.filter(s => all[s]).map(s => all[s])
     .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
 }
-
 function getSnapshot(slot, snapshotId) {
   const all = readBackups();
   const entry = all[slot];
@@ -74,7 +67,6 @@ function getSnapshot(slot, snapshotId) {
   if (!fs.existsSync(encFile(slot))) return null;
   return entry;
 }
-
 function saveUpload(slot, metadata) {
   const all = readBackups();
   const id = `${slot}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
@@ -93,60 +85,114 @@ function saveUpload(slot, metadata) {
   return all[slot];
 }
 
-// ── MCP Server ────────────────────────────────────────
-const mcp = new McpServer({ name: 'niannian-cloud', version: '1.0.0' });
+// ── 手写 JSON-RPC 处理 ────────────────────────────────
+const SERVER_INFO = { name: 'niannian-cloud', version: '1.0.0' };
 
-mcp.tool('phone_cloud_backup', {
-  action: z.enum(['list', 'prepare_upload', 'prepare_download']).describe('操作类型'),
-  protocolVersion: z.literal(1).describe('协议版本，固定为 1'),
-  slot: z.enum(['manual', 'auto-1', 'auto-2', 'auto-3']).optional().describe('备份槽位'),
-  snapshotId: z.string().optional().describe('快照 ID'),
-  metadata: z.any().optional().describe('存档元数据'),
-}, async (args) => {
-  switch (args.action) {
-    case 'list': {
-      const snapshots = listSnapshots();
+function handleJsonRpc(method, params) {
+  switch (method) {
+
+    // ── initialize ──
+    case 'initialize':
       return {
-        content: [{ type: 'text', text: JSON.stringify({ snapshots }) }],
-        structuredContent: { snapshots },
-        isError: false,
+        protocolVersion: params.protocolVersion || '2025-03-26',
+        capabilities: { tools: {} },
+        serverInfo: SERVER_INFO,
       };
-    }
-    case 'prepare_upload': {
-      if (!args.slot) throw new Error('slot 为必填项');
-      if (!args.metadata) throw new Error('metadata 为必填项');
-      fs.writeFileSync(pendingFile(args.slot), JSON.stringify(args.metadata), 'utf-8');
-      const token = signPayload({ slot: args.slot, action: 'upload', exp: Date.now() + TOKEN_TTL_MS });
-      const uploadUrl = `${PUBLIC_URL}/api/upload/${args.slot}?token=${encodeURIComponent(token)}`;
+
+    // ── tools/list ──
+    case 'tools/list':
       return {
-        content: [{ type: 'text', text: JSON.stringify({ uploadUrl, method: 'PUT', headers: { 'Content-Type': 'application/octet-stream' } }) }],
-        structuredContent: { uploadUrl, method: 'PUT', headers: { 'Content-Type': 'application/octet-stream' } },
-        isError: false,
+        tools: [{
+          name: 'phone_cloud_backup',
+          description: '小手机云端备份 — 按小手机固定协议列出、上传和下载加密存档。',
+          inputSchema: {
+            type: 'object',
+            required: ['action', 'protocolVersion'],
+            properties: {
+              action: {
+                type: 'string',
+                enum: ['list', 'prepare_upload', 'prepare_download'],
+              },
+              protocolVersion: { type: 'integer', const: 1 },
+              slot: {
+                type: 'string',
+                enum: ['manual', 'auto-1', 'auto-2', 'auto-3'],
+              },
+              snapshotId: { type: 'string' },
+              metadata: { type: 'object' },
+            },
+            additionalProperties: true,
+          },
+        }],
       };
+
+    // ── tools/call ──
+    case 'tools/call': {
+      const { name, arguments: args } = params;
+      if (name !== 'phone_cloud_backup') throw createRpcError(-32601, `Unknown tool: ${name}`);
+
+      validateProtocolVersion(args?.protocolVersion);
+
+      switch (args?.action) {
+        case 'list': {
+          const snapshots = listSnapshots();
+          return { content: [{ type: 'text', text: JSON.stringify({ snapshots }) }], isError: false };
+        }
+        case 'prepare_upload': {
+          if (!args.slot) throw createRpcError(-32602, 'slot 为必填项');
+          if (!args.metadata) throw createRpcError(-32602, 'metadata 为必填项');
+          fs.writeFileSync(pendingFile(args.slot), JSON.stringify(args.metadata), 'utf-8');
+          const token = signPayload({ slot: args.slot, action: 'upload', exp: Date.now() + TOKEN_TTL_MS });
+          const uploadUrl = `${PUBLIC_URL}/api/upload/${args.slot}?token=${encodeURIComponent(token)}`;
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ uploadUrl, method: 'PUT', headers: { 'Content-Type': 'application/octet-stream' } }) }],
+            isError: false,
+          };
+        }
+        case 'prepare_download': {
+          if (!args.slot) throw createRpcError(-32602, 'slot 为必填项');
+          if (!args.snapshotId) throw createRpcError(-32602, 'snapshotId 为必填项');
+          const snapshot = getSnapshot(args.slot, args.snapshotId);
+          if (!snapshot) throw createRpcError(-32602, '快照不存在或不属于当前槽位');
+          const token = signPayload({ slot: args.slot, action: 'download', exp: Date.now() + TOKEN_TTL_MS });
+          const downloadUrl = `${PUBLIC_URL}/api/download/${args.slot}?token=${encodeURIComponent(token)}`;
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ downloadUrl, headers: {} }) }],
+            isError: false,
+          };
+        }
+        default:
+          throw createRpcError(-32602, `不支持的 action: ${args?.action}`);
+      }
     }
-    case 'prepare_download': {
-      if (!args.slot) throw new Error('slot 为必填项');
-      if (!args.snapshotId) throw new Error('snapshotId 为必填项');
-      const snapshot = getSnapshot(args.slot, args.snapshotId);
-      if (!snapshot) throw new Error('快照不存在或不属于当前槽位');
-      const token = signPayload({ slot: args.slot, action: 'download', exp: Date.now() + TOKEN_TTL_MS });
-      const downloadUrl = `${PUBLIC_URL}/api/download/${args.slot}?token=${encodeURIComponent(token)}`;
-      return {
-        content: [{ type: 'text', text: JSON.stringify({ downloadUrl, headers: {} }) }],
-        structuredContent: { downloadUrl, headers: {} },
-        isError: false,
-      };
-    }
+
+    // ── notifications/initialized ──
+    case 'notifications/initialized':
+      return null; // 无需响应
+
+    case 'ping':
+      return {};
+
+    default:
+      throw createRpcError(-32601, `Method not found: ${method}`);
   }
-});
+}
+
+function createRpcError(code, message) {
+  const err = new Error(message);
+  err.code = code;
+  return err;
+}
+
+function validateProtocolVersion(v) {
+  if (v !== 1) throw createRpcError(-32602, `不支持的 protocolVersion: ${v}，仅支持 1`);
+}
 
 // ── Express ───────────────────────────────────────────
 const app = express();
 
-// CORS 先注册
 app.use(cors({
-  origin: true,
-  credentials: true,
+  origin: true, credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: [
     'Content-Type', 'Authorization', 'Accept',
@@ -156,16 +202,7 @@ app.use(cors({
   exposedHeaders: ['Mcp-Session-Id'],
 }));
 
-// JSON body parser —— MCP 端点用
 app.use('/mcp', express.json());
-
-// 上传端点 —— 原始二进制
-app.use('/api/upload/:slot', (req, res, next) => {
-  const chunks = [];
-  req.on('data', (chunk) => chunks.push(chunk));
-  req.on('end', () => { req.rawBody = Buffer.concat(chunks); next(); });
-  req.on('error', next);
-});
 
 // Auth
 function authGuard(req, res, next) {
@@ -173,24 +210,33 @@ function authGuard(req, res, next) {
   if (extractToken(req) !== AUTH_TOKEN) {
     return res.status(401).json({
       jsonrpc: '2.0', id: null,
-      error: { code: -32001, message: 'Unauthorized: token 不正确' },
+      error: { code: -32001, message: 'Unauthorized' },
     });
   }
   next();
 }
 
-// ── MCP Streamable HTTP ──
-const transport = new StreamableHTTPServerTransport();
-await mcp.connect(transport);
+// ── MCP 端点 ──
+app.post('/mcp', authGuard, (req, res) => {
+  const { method, params, id } = req.body || {};
 
-app.post('/mcp', authGuard, async (req, res) => {
+  if (!method || typeof method !== 'string') {
+    return res.status(400).json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid Request' } });
+  }
+
   try {
-    await transport.handleRequest(req, res, req.body);
-  } catch (err) {
-    console.error('[MCP]', err);
-    if (!res.headersSent) {
-      res.status(500).json({ jsonrpc: '2.0', id: null, error: { code: -32603, message: 'Internal server error' } });
+    const result = handleJsonRpc(method, params);
+
+    // notification（无 id）= 不需要响应
+    if (id === undefined || id === null) {
+      if (result === null) return res.status(202).end();
+      return res.status(200).json({ jsonrpc: '2.0', result });
     }
+
+    return res.status(200).json({ jsonrpc: '2.0', id, result });
+  } catch (err) {
+    const code = err.code || -32603;
+    return res.status(200).json({ jsonrpc: '2.0', id: id || null, error: { code, message: err.message } });
   }
 });
 
@@ -202,17 +248,20 @@ app.put('/api/upload/:slot', (req, res) => {
   if (!payload || payload.slot !== slot || payload.action !== 'upload')
     return res.status(403).json({ error: '签名无效或已过期' });
 
-  const buf = req.rawBody;
-  if (!buf || buf.length === 0) return res.status(400).json({ error: '请求体为空' });
-  if (buf.length > MAX_BODY_BYTES) return res.status(413).json({ error: '文件超过 512MB 上限' });
-
-  fs.writeFileSync(encFile(slot), buf);
-  let metadata = {};
-  try { metadata = JSON.parse(fs.readFileSync(pendingFile(slot), 'utf-8')); } catch {}
-  const saved = saveUpload(slot, metadata);
-  try { fs.unlinkSync(pendingFile(slot)); } catch {}
-  console.log(`[upload] slot=${slot} id=${saved.id} bytes=${saved.bytes}`);
-  res.status(200).json({ ok: true, id: saved.id });
+  const chunks = [];
+  req.on('data', c => chunks.push(c));
+  req.on('end', () => {
+    const buf = Buffer.concat(chunks);
+    if (!buf || buf.length === 0) return res.status(400).json({ error: '请求体为空' });
+    if (buf.length > MAX_BODY_BYTES) return res.status(413).json({ error: '文件超过 512MB 上限' });
+    fs.writeFileSync(encFile(slot), buf);
+    let metadata = {};
+    try { metadata = JSON.parse(fs.readFileSync(pendingFile(slot), 'utf-8')); } catch {}
+    const saved = saveUpload(slot, metadata);
+    try { fs.unlinkSync(pendingFile(slot)); } catch {}
+    console.log(`[upload] slot=${slot} id=${saved.id} bytes=${saved.bytes}`);
+    res.status(200).json({ ok: true, id: saved.id });
+  });
 });
 
 // ── 下载 ──
@@ -235,6 +284,5 @@ app.get('/', (_req, res) => res.json({ ok: true, name: 'niannian-cloud', mcp: '/
 app.listen(PORT, () => {
   console.log(`[niannian-cloud] MCP → ${PUBLIC_URL}/mcp`);
   console.log(`[niannian-cloud] Auth → ${AUTH_TOKEN ? 'Bearer / ' + AUTH_HEADER_NAME : 'OFF'}`);
-  console.log(`[niannian-cloud] Data → ${DATA_DIR}`);
   console.log(`[niannian-cloud] Port → ${PORT}`);
 });
